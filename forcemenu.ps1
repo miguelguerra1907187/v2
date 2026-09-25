@@ -1,65 +1,11 @@
-<#
-  forcemenu.ps1 - Menu local de notas FORCE 1 / FORCE 2.
-  100% local: sin red, sin disco, sin registro, sin hooks globales
-  (GetAsyncKeyState por polling).
-
-  MAPA DE TECLAS (el mismo significado en TODAS las pantallas)
-    Supr ............ abrir / cerrar el menu (cancela todo)
-    Enter ........... confirmar / siguiente paso
-    Esc o Inicio .... regresar un paso
-    1-9 (o numpad) .. elegir opcion (en listas multi: marcar/desmarcar)
-    Flechas / Tab ... mover resaltado      Espacio .... marcar (multi)
-
-  PANTALLA INICIAL
-    F1 = 1 / Izquierda      F2 = 2 / Derecha
-    Historial (ultimas 3 notas, si hay) = 3 / 4 / 5, o clic
-
-  REGLAS DE HOLD
-    F2 siempre lleva hold. F1 solo si incluye un issue de cons.
-    Con hold, Enter en "revisar" copia primero la nota ERP (para
-    pegarla en el ERP y sacar el PRO/terminal). La terminal NO se
-    pide en ese momento -- se pide despues, cuando le das Insert
-    para pasar a la nota de intra/hold, ya que trajiste el numero
-    de terminal. Mientras tanto la pantalla "listo" no se cierra
-    sola (el timer de 30 seg no arranca hasta que la nota de hold
-    ya este completa).
-
-  AL TERMINAR
-    Copia la nota (ERP si lleva hold pendiente, o intra/hold si no
-    hay hold). En la pantalla "listo": 1 = copiar la nota actual
-    otra vez, 2 = copiar ERP (si son distintas). Insert alterna
-    entre la nota de intra y la del ERP, o -- si el hold sigue
-    pendiente de terminal -- abre la pantalla de terminal. Funciona
-    con el menu abierto (pantalla "listo", con indicador de cual
-    quedo en el portapapeles) o cerrado, y no necesita que la
-    ventana tenga el foco (se detecta por polling, igual que Supr).
-    Una vez que la nota esta completa, la pantalla se queda abierta
-    30 seg antes de cerrarse sola (Supr cierra antes si quieres).
-    Cada nota terminada se guarda en el historial (maximo 3, solo
-    en memoria) para volver a copiarla rapido desde la pantalla
-    inicial.
-    Si $UsarMacros = $true, corre la secuencia de macros de TinyTask
-    DENTRO de este mismo proceso (sin abrir otra PowerShell, sin
-    argumentos codificados). Mientras corre: Supr e Insert desactivados,
-    y Pausa (Pause/Break) aborta. Las macros nunca guardan: el
-    guardado es manual.
-#>
-
 if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
-    # conhost.exe --headless: crea la consola sin ventana en absoluto, para
-    # que Windows Terminal no la agarre y le ponga su propia ventana (eso
-    # es lo que pasaba con "-WindowStyle Hidden" o WScript.Shell solos).
+
     Start-Process -FilePath 'conhost.exe' -ArgumentList @(
         '--headless', 'powershell.exe', '-NoProfile', '-STA', '-File', "`"$PSCommandPath`""
     ) -WindowStyle Hidden
     exit
 }
 
-# Instancia unica: si el .bat (o el doble-clic) se dispara dos veces por
-# accidente, la segunda copia se cierra sola aqui mismo, antes de crear
-# una segunda ventana/otro set de hotkeys compitiendo con el primero.
-# "Local\" (no "Global\") porque en una cuenta restringida no siempre hay
-# permiso para crear un mutex a nivel de sesion completa del sistema.
 $script:SingleInstanceMutex = New-Object System.Threading.Mutex($false, 'Local\ForceMenu_Miguel_SingleInstance')
 if (-not $script:SingleInstanceMutex.WaitOne(0)) {
     exit
@@ -68,7 +14,7 @@ if (-not $script:SingleInstanceMutex.WaitOne(0)) {
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
-Add-Type -AssemblyName System.Windows.Forms   # SendKeys (Ctrl+1 para saltar de pestana en Edge)
+Add-Type -AssemblyName System.Windows.Forms
 
 Add-Type @"
 using System;
@@ -102,11 +48,9 @@ public class LocalKeyState {
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetConsoleWindow();
 
-    // El script se esconde a si mismo apenas arranca, sin importar como lo
-    // haya lanzado el .bat o si Windows Terminal decidio mostrar algo.
     public static void HideConsole() {
         IntPtr h = GetConsoleWindow();
-        if (h != IntPtr.Zero) { ShowWindow(h, 0); } // SW_HIDE
+        if (h != IntPtr.Zero) { ShowWindow(h, 0); }
     }
 
     [DllImport("user32.dll", SetLastError = true)]
@@ -118,7 +62,6 @@ public class LocalKeyState {
     private const int WS_EX_TOOLWINDOW = 0x00000080;
     private const int WS_EX_APPWINDOW  = 0x00040000;
 
-    // Saca la ventana del Alt+Tab (ademas de no estar en la barra de tareas).
     public static void HideFromAltTab(IntPtr hWnd) {
         int exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
         exStyle |= WS_EX_TOOLWINDOW;
@@ -128,19 +71,17 @@ public class LocalKeyState {
 
     public static bool IsForeground(IntPtr hWnd) { return GetForegroundWindow() == hWnd; }
 
-    // Clic simulado al boton Play de TinyTask (no mueve el mouse real).
     public static void ClickAt(IntPtr hWnd, int x, int y) {
         IntPtr lParam = (IntPtr)((y << 16) | (x & 0xFFFF));
-        PostMessage(hWnd, 0x0201, (IntPtr)1, lParam);   // WM_LBUTTONDOWN
-        PostMessage(hWnd, 0x0202, IntPtr.Zero, lParam); // WM_LBUTTONUP
+        PostMessage(hWnd, 0x0201, (IntPtr)1, lParam);
+        PostMessage(hWnd, 0x0202, IntPtr.Zero, lParam);
     }
 
     private const byte VK_MENU = 0x12;
     private const uint KEYEVENTF_KEYUP = 0x2;
 
     public static void ForceForeground(IntPtr hWnd) {
-        // Truco: Windows solo cede el foreground a un proceso que "acaba de
-        // recibir input" propio; simular un Alt fantasma satisface ese chequeo.
+
         keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);
         keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
 
@@ -152,7 +93,7 @@ public class LocalKeyState {
         if (fgThread != curThread) {
             attached = AttachThreadInput(curThread, fgThread, true);
         }
-        ShowWindow(hWnd, IsIconic(hWnd) ? 9 : 5); // SW_RESTORE si esta minimizada
+        ShowWindow(hWnd, IsIconic(hWnd) ? 9 : 5);
         BringWindowToTop(hWnd);
         SetForegroundWindow(hWnd);
         if (attached) {
@@ -164,46 +105,27 @@ public class LocalKeyState {
 
 [LocalKeyState]::HideConsole()
 
-# ======================= CONFIGURACION =======================
-
 $HoldText   = 'Hold at term xxx DUE TO'
 
-# Identificador de version, visible chiquito en la pantalla inicial, para
-# poder confirmar a simple vista (sin abrir el .ps1) que estas corriendo
-# el build mas nuevo y no una copia vieja. Cambialo cuando yo te mande
-# una version nueva, o pideme que te diga cual deberias ver.
-$ScriptVersion = 'build 2026-09-24b (hold en 2 pasos + try/catch + 30s)'
+$ScriptVersion = 'build 2026-09-25g (campos pro sticker corregidos)'
 
-# ---------------- MACROS (TinyTask) ----------------
-$UsarMacros = $false   # <-- $true cuando ya tengas las macros grabadas y probadas
+$UsarMacros = $false
 
-# ##########################################################
-# ##   >>>>  CAMBIA $usarTrabajo SEGUN LA PC  <<<<        ##
-# ##########################################################
-$usarTrabajo    = $false   # <-- $true en la PC del trabajo, $false en casa
+$usarTrabajo    = $false
 $carpetaCasa    = "C:\Users\Mike1\OneDrive\Escritorio\Nueva carpeta"
 $carpetaTrabajo = "C:\Users\mguerrasifuentes\Desktop\New folder\prueba"
 $carpetaMacros  = if ($usarTrabajo) { $carpetaTrabajo } else { $carpetaCasa }
 $tinyTaskProc   = 'tinytask-1-77'
-$playBtnX       = 152      # igual en casa y trabajo
+$playBtnX       = 152
 $playBtnY       = 23
-$esperaAbrir    = 3        # seg tras abrir el .rec, antes de dar Play
-$esperaFocoMs   = 300      # ms tras enfocar la ventana destino
+$esperaAbrir    = 3
+$esperaFocoMs   = 300
 
-# Parte FIJA del titulo de cada ventana (sin PROs ni clientes).
-# Vacio = no se cambia de ventana en ese paso.
-# INTRA = la ventana de Microsoft Edge. Al enfocarla, el script manda
-# Ctrl+1 para asegurar que quede en la pestana 1 (donde siempre se pega
-# la nota), sin importar cual pestana estaba activa antes. La maquina
-# virtual nunca se toca: solo se busca por el titulo de ERP/Edge.
 $Ventanas = @{
     ERP   = ''
     INTRA = ''
 }
 
-# Pasos:  macro -> @{ Tipo='macro'; Rec='x.rec'; Foco='ERP'|'INTRA'|''; DuracionSeg=N; PausaDespuesSeg=N }
-#         clip  -> @{ Tipo='clip'; Texto='{INTRA}' | '{ERP}' }
-# Ninguna macro debe usar Alt+Tab ni guardar.
 $SecuenciaBase = @(
     @{ Tipo='macro'; Rec='copiar_pro.rec';       Foco='ERP';   DuracionSeg=3; PausaDespuesSeg=1 }
     @{ Tipo='macro'; Rec='pegar_pro_intra.rec';  Foco='INTRA'; DuracionSeg=3; PausaDespuesSeg=1 }
@@ -214,11 +136,9 @@ $SecuenciaBase = @(
 )
 $Recetas = @{ f1 = $SecuenciaBase; haz = $SecuenciaBase }
 
-$Campos       = @('address','name','zip','city','state','pro#','weight','other')
+$Campos       = @('bol','po','quote','weight','reference num')
 $ConsShprList = @('city/zip dont route','address','name','zip','city','state','name,add,city,state,zip')
-$RazonesProSticker = @('covering info','indexed pro mismatch')
 
-# Posiciones fijas: el numero de cada issue nunca cambia (memoria muscular).
 $Force1Issues = @(
     [PSCustomObject]@{ Label='cons';         Tag='cons';         Sub='multi'; SubList=$ConsShprList }
     [PSCustomObject]@{ Label='shpr';         Tag='shpr';         Sub='multi'; SubList=$ConsShprList }
@@ -229,16 +149,14 @@ $Force1Issues = @(
 $Force2Issues = @(
     [PSCustomObject]@{ Label='improper shipping name';    Tag='improper shipping name';    Sub='none' }
     [PSCustomObject]@{ Label='no hazmat info';            Tag='no hazmat info';            Sub='none' }
-    [PSCustomObject]@{ Label='missing chemical const.';   Tag='missing chemical const.';   Sub='none' }
+    [PSCustomObject]@{ Label='missing chemical const.';   Tag='missing chemical const for'; Sub='text'; Prompt='Item que falta'; Sep=' ' }
     [PSCustomObject]@{ Label='weight breakdown';          Tag='weight breakdown';          Sub='none' }
     [PSCustomObject]@{ Label='missing emergency contact'; Tag='missing emergency contact'; Sub='none' }
     [PSCustomObject]@{ Label='shipper cert not signed';   Tag='shipper cert not signed';   Sub='none' }
-    [PSCustomObject]@{ Label='prohibited freight';        Tag='prohibited freight';        Sub='none' }
+    [PSCustomObject]@{ Label='prohibited freight';        Tag='prohibited';                Sub='text'; Prompt='Nombre de la carga' }
     [PSCustomObject]@{ Label='missing page';              Tag='missing page';              Sub='none' }
 )
 
-# Colores: cada tipo tiene el suyo en toda la pantalla, para reconocerlo
-# de reojo sin leer. F2 usa ambar tipo placa de hazmat.
 $C = @{
     Bg        = '#16191D'
     Panel     = '#1F242A'
@@ -253,25 +171,24 @@ $C = @{
 $SEP   = ' ' + [char]0x203A + ' '
 $CHECK = [string][char]0x2713
 
-# ======================= ESTADO =======================
-
-$script:State        = 'hidden'   # hidden | nivel1 | list | confirm | terminal | done
+$script:State        = 'hidden'
 $script:Basket       = New-Object System.Collections.Generic.List[string]
-$script:CurrentForce = $null      # f1 | haz | hold
+$script:CurrentForce = $null
 $script:CurrentIssue = $null
-$script:ListCtx      = ''         # issue | multi-tag | pro-reason | pro-fields
+$script:ListCtx      = ''
 $script:LM_Options   = @()
 $script:LM_Multi     = $false
 $script:LM_Highlight = 0
 $script:LM_Selected  = New-Object System.Collections.Generic.HashSet[int]
 $script:TermDigits   = ''
+$script:FreeText      = ''
+$script:FreeTextIssue = $null
+$script:FreeTextBox   = $null
 $script:NotaERP      = ''
 $script:LastCopied   = ''
 $script:NotePair     = @()
 $script:NoteIdx      = 0
-$script:History      = New-Object System.Collections.Generic.List[object]  # ultimas notas (max 3, solo en memoria)
-
-# ======================= VENTANA =======================
+$script:History      = New-Object System.Collections.Generic.List[object]
 
 $Win = New-Object System.Windows.Window
 $Win.WindowStyle           = 'None'
@@ -286,15 +203,11 @@ $Win.Visibility            = 'Hidden'
 $RootGrid = New-Object System.Windows.Controls.Grid
 $Win.Content = $RootGrid
 
-# En cuanto exista el HWND (aunque la ventana siga oculta), se le quita
-# el estilo que la hace aparecer en el Alt+Tab.
 $Win.Add_SourceInitialized({
     param($s, $e)
     $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($Win)).Handle
     [LocalKeyState]::HideFromAltTab($hwnd)
 })
-
-# ======================= HELPERS DE UI =======================
 
 function B([string]$hex) { return [System.Windows.Media.BrushConverter]::new().ConvertFromString($hex) }
 function Get-Soft([string]$hex) { return '#33' + $hex.Substring(1) }
@@ -322,12 +235,18 @@ function Get-ForceLabel {
     return ''
 }
 function Get-Issues { if ($script:CurrentForce -eq 'f1') { $Force1Issues } else { $Force2Issues } }
-function Get-NotaERP { return "$(Get-Prefix)-" + ($script:Basket -join ',') }
+function Get-NotaERP {
+
+    if ($script:Basket.Count -eq 1 -and $script:Basket[0] -like 'prohibited-*') {
+        return $script:Basket[0]
+    }
+    return "$(Get-Prefix)-" + ($script:Basket -join ',')
+}
 
 function New-Text([string]$t, [double]$size = 14, [string]$color = '', [string]$weight = 'Normal') {
     if (-not $color) { $color = $C.Text }
     $tb = New-Object System.Windows.Controls.TextBlock
-    $tb.Text = $t
+    $tb.Text = $t.ToUpper()
     $tb.FontSize = $size
     $tb.FontFamily = 'Segoe UI'
     $tb.Foreground = B $color
@@ -353,8 +272,6 @@ function New-Keycap([string]$label, [string]$accent = '', [double]$size = 12) {
     return $b
 }
 
-# Marco comun de todas las pantallas: encabezado (donde estas), cuerpo,
-# nota en vivo, y barra de teclas siempre en el mismo lugar y orden.
 function Show-Frame {
     param([string]$crumb, $body, [string[]]$preview, [string[]]$keys, [string]$accent)
     Clear-Root
@@ -390,10 +307,9 @@ function Show-Frame {
         for ($i = 0; $i -lt $preview.Count - 1; $i += 2) {
             $lab = New-Text $preview[$i] 11 $C.Dim
             if ($i -gt 0) { $lab.Margin = '0,6,0,0' }
-            # TextBox de solo lectura (no TextBlock) para poder seleccionar
-            # con el mouse y copiar con Ctrl+C, sin depender de Insert.
+
             $txt = New-Object System.Windows.Controls.TextBox
-            $txt.Text = $preview[$i + 1]
+            $txt.Text = $preview[$i + 1].ToUpper()
             $txt.IsReadOnly = $true
             $txt.IsUndoEnabled = $false
             $txt.BorderThickness = '0'
@@ -433,8 +349,6 @@ function Show-Frame {
 
     [void]$RootGrid.Children.Add($outer)
 }
-
-# ======================= PANTALLA 1: tipo =======================
 
 function New-Tile([string]$tag, [string]$key, [string]$title, [string]$sub, [string]$accent, [double]$width = 128) {
     $b = New-Object System.Windows.Controls.Border
@@ -534,8 +448,6 @@ function Select-Nivel1([string]$which) {
     Enter-IssueMenu
 }
 
-# ======================= LISTAS (issues y sub-opciones) =======================
-
 function Enter-IssueMenu {
     $script:CurrentIssue = $null
     $labels = @(Get-Issues | ForEach-Object { $_.Label })
@@ -606,7 +518,6 @@ function Draw-List {
     Show-Frame -crumb (Get-Crumb) -body $stack -preview @('Nota', (Get-PreviewNote)) -keys $keys -accent $accent
 }
 
-# Devuelve $null (sigue), 'BACK', string (single) o string[] (multi).
 function Process-ListKey([string]$k) {
     $count = $script:LM_Options.Count
     if ($count -eq 0) { return $null }
@@ -628,7 +539,7 @@ function Process-ListKey([string]$k) {
     }
     if ($k -eq 'Return' -or $k -eq 'Enter') {
         if ($script:LM_Multi) {
-            # Si no marcaste nada, Enter toma el resaltado.
+
             if ($script:LM_Selected.Count -eq 0) { [void]$script:LM_Selected.Add($script:LM_Highlight) }
             return ,@($script:LM_Selected | Sort-Object | ForEach-Object { $script:LM_Options[$_] })
         }
@@ -665,20 +576,13 @@ function Key-List([string]$k) {
             switch ($script:CurrentIssue.Sub) {
                 'none'  { $script:Basket.Add($script:CurrentIssue.Tag); Enter-Confirm }
                 'multi' { Enter-List $script:CurrentIssue.SubList $true 'multi-tag' }
-                'pro'   { Enter-List $RazonesProSticker $false 'pro-reason' }
+                'pro'   { Enter-List $Campos $true 'pro-fields' }
+                'text'  { Enter-FreeText $script:CurrentIssue }
             }
         }
         'multi-tag' {
             $script:Basket.Add($script:CurrentIssue.Tag + '-' + ($result -join ','))
             Enter-Confirm
-        }
-        'pro-reason' {
-            if ($result -eq 'covering info') {
-                Enter-List $Campos $true 'pro-fields'
-            } else {
-                $script:Basket.Add('pro sticker-mismatch')
-                Enter-Confirm
-            }
         }
         'pro-fields' {
             $script:Basket.Add('pro sticker-' + ($result -join ','))
@@ -687,9 +591,6 @@ function Key-List([string]$k) {
     }
 }
 
-# ======================= CONFIRMACION =======================
-
-# F2 siempre va a terminal. F1 solo si hay issue de consignee.
 function Test-NeedsHold {
     if ($script:CurrentForce -ne 'f1') { return $true }
     return [bool]($script:Basket | Where-Object { $_ -match '^cons' })
@@ -738,8 +639,6 @@ function Key-Confirm([string]$k) {
     }
 }
 
-# ======================= TERMINAL =======================
-
 function Enter-Terminal {
     $script:TermDigits = ''
     $script:NotaERP = if ($script:CurrentForce -eq 'hold') { '' } else { Get-NotaERP }
@@ -750,7 +649,7 @@ function Enter-Terminal {
 function Get-NotaIntra([string]$term) {
     $base = $HoldText -replace 'xxx', $term
     if ($script:NotaERP) { return "$base $($script:NotaERP)" }
-    return "$base "   # HOLD solo: espacio final para seguir escribiendo
+    return "$base "
 }
 
 function Draw-Terminal {
@@ -758,7 +657,6 @@ function Draw-Terminal {
     $body = New-Object System.Windows.Controls.StackPanel
     [void]$body.Children.Add((New-Text 'Terminal' 11 $C.Dim))
 
-    # Siempre 3 casillas: la pantalla no cambia de tamano mientras tecleas.
     $boxes = New-Object System.Windows.Controls.StackPanel
     $boxes.Orientation = 'Horizontal'
     $boxes.Margin = '0,6,0,0'
@@ -805,7 +703,108 @@ function Key-Terminal([string]$k) {
     }
 }
 
-# ======================= TERMINAR: copiar + macros =======================
+function Enter-FreeText($issue) {
+    $script:FreeTextIssue = $issue
+    $script:FreeText = ''
+    $script:FreeTextBox = $null
+    $script:State = 'freetext'
+    Draw-FreeText
+}
+
+function Draw-FreeText {
+    $accent = Get-Accent
+    $body = New-Object System.Windows.Controls.StackPanel
+    [void]$body.Children.Add((New-Text $script:FreeTextIssue.Prompt 11 $C.Dim))
+
+    $tb = New-Object System.Windows.Controls.TextBox
+    $tb.Margin = '0,8,0,0'
+    $tb.FontSize = 18
+    $tb.FontFamily = 'Consolas'
+    $tb.Background = B $C.Panel
+    $tb.Foreground = B $C.Text
+    $tb.CaretBrush = B $C.Text
+    $tb.BorderBrush = B $accent
+    $tb.BorderThickness = '2'
+    $tb.Padding = '8,6,8,6'
+    $tb.CharacterCasing = 'Upper'
+    $tb.Text = $script:FreeText
+    $tb.MaxLength = 60
+    [void]$body.Children.Add($tb)
+    $script:FreeTextBox = $tb
+
+    $previewLbl = New-Text '' 12 $C.Dim
+    $previewLbl.Margin = '0,10,0,0'
+    $previewLbl.FontFamily = 'Consolas'
+    [void]$body.Children.Add($previewLbl)
+
+    $tag = $script:FreeTextIssue.Tag
+    $sep = if ($script:FreeTextIssue.Sep) { $script:FreeTextIssue.Sep } else { '-' }
+    $refreshPreview = {
+        $texto = if ($tb.Text) { $tb.Text } else { '...' }
+        $previewLbl.Text = ("Nota: $tag$sep$texto").ToUpper()
+    }.GetNewClosure()
+    & $refreshPreview
+
+    $tb.Add_TextChanged({
+        $script:FreeText = $tb.Text
+        & $refreshPreview
+    }.GetNewClosure())
+
+    Show-Frame -crumb ((Get-ForceLabel) + $SEP + $script:FreeTextIssue.Label) -body $body -preview $null `
+        -keys @('Enter','confirmar','Esc','cancelar') -accent $accent
+
+    $tb.Focus() | Out-Null
+    [System.Windows.Input.Keyboard]::Focus($tb) | Out-Null
+}
+
+function Key-FreeText([string]$k) {
+    if ($k -eq 'Return' -or $k -eq 'Enter') {
+        $raw = if ($script:FreeTextBox) { $script:FreeTextBox.Text } else { $script:FreeText }
+        $texto = ('' + $raw).Trim()
+        $sep = if ($script:FreeTextIssue.Sep) { $script:FreeTextIssue.Sep } else { '-' }
+        if ($texto) { $script:Basket.Add($script:FreeTextIssue.Tag + $sep + $texto) }
+        Enter-Confirm
+        return
+    }
+    if ($k -eq 'Escape' -or $k -eq 'Home') {
+        Enter-IssueMenu
+    }
+}
+
+function Enter-UpperTool {
+    $script:State = 'upper'
+    Draw-UpperTool
+}
+
+function Draw-UpperTool {
+    $accent = $C.Dim
+    $body = New-Object System.Windows.Controls.StackPanel
+    [void]$body.Children.Add((New-Text 'Pega el texto (Ctrl+V). Se convierte solo a mayusculas. Copia lo que necesites (Ctrl+C).' 11 $C.Dim))
+
+    $tb = New-Object System.Windows.Controls.TextBox
+    $tb.Margin = '0,8,0,0'
+    $tb.FontSize = 14
+    $tb.FontFamily = 'Consolas'
+    $tb.Background = B $C.Panel
+    $tb.Foreground = B $C.Text
+    $tb.CaretBrush = B $C.Text
+    $tb.BorderBrush = B $accent
+    $tb.BorderThickness = '2'
+    $tb.Padding = '8,6,8,6'
+    $tb.CharacterCasing = 'Upper'
+    $tb.AcceptsReturn = $true
+    $tb.AcceptsTab = $true
+    $tb.TextWrapping = 'Wrap'
+    $tb.VerticalScrollBarVisibility = 'Auto'
+    $tb.Height = 220
+    [void]$body.Children.Add($tb)
+
+    Show-Frame -crumb 'Mayusculas' -body $body -preview $null `
+        -keys @('Ctrl+V','pegar','Ctrl+C','copiar','Esc','regresar') -accent $accent
+
+    $tb.Focus() | Out-Null
+    [System.Windows.Input.Keyboard]::Focus($tb) | Out-Null
+}
 
 $script:SeqActions = New-Object System.Collections.Generic.List[object]
 $script:SeqIdx     = 0
@@ -815,9 +814,7 @@ $script:SeqTimer   = New-Object System.Windows.Threading.DispatcherTimer
 $script:SeqTimer.Add_Tick({ param($s, $e) $s.Stop(); Step-Seq })
 
 function Strip-Formato([string]$s) {
-    # Chrome/Edge a veces meten caracteres Unicode invisibles (marcas de
-    # direccion de texto) junto a los guiones del titulo, que rompen la
-    # comparacion exacta aunque se vean identicos. Se quitan aqui.
+
     -join ($s.ToCharArray() | Where-Object {
         [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($_) -ne [System.Globalization.UnicodeCategory]::Format
     })
@@ -847,14 +844,13 @@ function Invoke-Act($a) {
             Start-Process -FilePath (Join-Path $carpetaMacros $a.Data)
         }
         'focus' {
-            # Se enfoca DESPUES de abrir TinyTask, asi no se queda con el foco.
+
             $script:SeqFocusH = [IntPtr]::Zero
             if ($a.Data -and $Ventanas[$a.Data]) {
                 $script:SeqFocusH = Find-Ventana $a.Data
                 [LocalKeyState]::ForceForeground($script:SeqFocusH)
                 if ($a.Data -eq 'INTRA') {
-                    # Edge: la nota siempre se pega en la pestana 1, sin
-                    # importar cual estaba activa antes de enfocar.
+
                     Start-Sleep -Milliseconds 100
                     [System.Windows.Forms.SendKeys]::SendWait('^1')
                 }
@@ -894,7 +890,6 @@ function Stop-Seq([string]$err) {
     }
 }
 
-# Revisa todo ANTES de tocar nada. Devuelve el mensaje para la pantalla final.
 function Start-Seq([string]$intra, [string]$erp) {
     if ($script:SeqRunning) { return 'Ya hay una secuencia corriendo' }
     $receta = $Recetas[$script:CurrentForce]
@@ -921,18 +916,14 @@ function Start-Seq([string]$intra, [string]$erp) {
     $script:SeqIdx = 0
     $script:SeqRunning = $true
     $circle.Fill = B '#3FB950'
-    # Arranca cuando el menu ya se cerro.
+
     $script:SeqTimer.Interval = [TimeSpan]::FromMilliseconds(1600)
     $script:SeqTimer.Start()
     return 'Macros en curso. Pausa (Pause/Break) = abortar'
 }
 
 function Set-Clip([string]$t) {
-    # El portapapeles de Windows a veces esta ocupado un instante (historial
-    # de portapapeles con Win+V, otra app copiando al mismo tiempo, dos
-    # copias muy seguidas, etc.) y SetText truena con "acceso denegado" sin
-    # avisar. Antes esto se perdia en silencio -- ahora reintenta varias
-    # veces antes de darse por vencido.
+    $t = $t.ToUpper()
     for ($i = 0; $i -lt 6; $i++) {
         try {
             [System.Windows.Clipboard]::SetText($t)
@@ -951,14 +942,10 @@ function Add-History([string]$intra, [string]$erp, [string]$forceType, [string]$
     while ($script:History.Count -gt 3) { $script:History.RemoveAt($script:History.Count - 1) }
 }
 
-# Estado de la pantalla "listo", para poder redibujarla al alternar con Insert
-# sin reiniciar el temporizador de cierre automatico.
 $script:DoneIntra   = ''
 $script:DoneErp     = ''
 $script:DoneMsg     = ''
-# Con hold: al confirmar se copia solo la nota ERP y la terminal se pide
-# despues (al darle Insert), para poder ir primero al ERP y sacar el PRO
-# sin que la pantalla ya este pidiendo la terminal.
+
 $script:PendingHold = $false
 
 function Draw-Done {
@@ -1024,9 +1011,6 @@ function Finish-Notes([string]$intra, [string]$erp, [bool]$addToHistory = $true,
     $script:State     = 'done'
     Draw-Done
 
-    # Mientras el hold siga pendiente de terminal no arranca el cierre
-    # automatico: puede tardar en ir al ERP, sacar el PRO y la terminal
-    # antes de volver a darle Insert.
     if ($pendingHold) { return }
 
     $t = New-Object System.Windows.Threading.DispatcherTimer
@@ -1046,8 +1030,6 @@ function Copy-FromHistory([int]$idx) {
     Finish-Notes $item.Intra $item.Erp $false $item.Terminal
 }
 
-# ======================= ABRIR / CERRAR =======================
-
 function Close-Menu {
     $script:Basket.Clear()
     $script:CurrentForce = $null
@@ -1058,8 +1040,7 @@ function Close-Menu {
 
 function Set-MenuFocus {
     $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($Win)).Handle
-    # WPF a veces reaplica el estilo de ventana al mostrarla, borrando el
-    # TOOLWINDOW que le quita el Alt+Tab -- se vuelve a poner cada vez.
+
     [LocalKeyState]::HideFromAltTab($hwnd)
     [LocalKeyState]::ForceForeground($hwnd)
     $Win.Activate() | Out-Null
@@ -1074,7 +1055,6 @@ function Open-Menu {
     Set-MenuFocus
     Show-Nivel1
 
-    # Reintento: Windows a veces ignora el primer intento de foco.
     $retry = New-Object System.Windows.Threading.DispatcherTimer
     $retry.Interval = [TimeSpan]::FromMilliseconds(120)
     $retry.Add_Tick({
@@ -1085,14 +1065,13 @@ function Open-Menu {
     $retry.Start()
 }
 
-# ======================= TECLADO =======================
-
 function Key-Nivel1([string]$k) {
     if ($k -match '^(Left|D1|NumPad1)$')  { Select-Nivel1 'f1';  return }
     if ($k -match '^(Right|D2|NumPad2)$') { Select-Nivel1 'haz'; return }
     if ($k -match '^(D3|NumPad3)$' -and $script:History.Count -ge 1) { Copy-FromHistory 0; return }
     if ($k -match '^(D4|NumPad4)$' -and $script:History.Count -ge 2) { Copy-FromHistory 1; return }
     if ($k -match '^(D5|NumPad5)$' -and $script:History.Count -ge 3) { Copy-FromHistory 2; return }
+    if ($k -eq 'M') { Enter-UpperTool; return }
     if ($k -eq 'Escape') { Close-Menu }
 }
 
@@ -1109,18 +1088,32 @@ function Key-Done([string]$k) {
         Draw-Done
         return
     }
-    # Insert (alternar Intra/ERP) se maneja en el polling global de hotkeys
-    # mas abajo, para que funcione aunque la ventana del menu no tenga foco.
+
 }
 
 function Handle-KeyDown {
     param($s, $e)
     if ($script:State -eq 'hidden') { return }
-    $e.Handled = $true
     $k = $e.Key.ToString()
-    # Sin este try/catch, un error suelto aqui dejaba la tecla sin hacer
-    # nada y sin avisar nada (se perdia en silencio). Con esto, si algo
-    # truena, el resto del programa sigue funcionando.
+
+    if ($script:State -eq 'freetext') {
+        if ($k -eq 'Return' -or $k -eq 'Enter' -or $k -eq 'Escape' -or $k -eq 'Home') {
+            $e.Handled = $true
+            try { Key-FreeText $k } catch { }
+        }
+        return
+    }
+
+    if ($script:State -eq 'upper') {
+        if ($k -eq 'Escape' -or $k -eq 'Home') {
+            $e.Handled = $true
+            try { Show-Nivel1 } catch { }
+        }
+        return
+    }
+
+    $e.Handled = $true
+
     try {
         switch ($script:State) {
             'nivel1'   { Key-Nivel1 $k }
@@ -1133,8 +1126,6 @@ function Handle-KeyDown {
 }
 
 $Win.Add_KeyDown({ param($s, $e) Handle-KeyDown $s $e })
-
-# ======================= WIDGET FLOTANTE =======================
 
 $Widget = New-Object System.Windows.Window
 $Widget.WindowStyle = 'None'
@@ -1150,22 +1141,12 @@ $screen = [System.Windows.SystemParameters]::WorkArea
 $Widget.Left = $screen.Right - 60
 $Widget.Top  = $screen.Bottom - 60
 
-# Circulo flotante: se dejo de mostrar (ya no se abre el menu con clic).
-# Se conserva el objeto (sin ventana visible) porque Start-Seq/Stop-Seq
-# lo usan para senalizar cuando corren macros; sin $Widget.Show() nunca
-# aparece nada en pantalla.
 $circle = New-Object System.Windows.Shapes.Ellipse
 $circle.Width = 42
 $circle.Height = 42
 $circle.Fill = B $C.F1
 $circle.Opacity = 0.85
 $Widget.Content = $circle
-
-# ======================= HOTKEYS (polling local) =======================
-# Supr abre y cierra. Insert (menu cerrado) repite / alterna notas.
-# Ambas se ignoran mientras corre una secuencia de macros, para que una
-# macro que presione Supr o Insert no abra el menu a media secuencia.
-# Pausa (Pause/Break) aborta la secuencia.
 
 $VK_DELETE = 0x2E
 $VK_INSERT = 0x2D
@@ -1185,6 +1166,7 @@ $hotkeyTimer.Add_Tick({
     $insEdge = $ins -and $script:InsArmed
     $script:DelArmed = -not $del
     $script:InsArmed = -not $ins
+    if ($script:State -eq 'upper') { return }
     if (-not ($delEdge -or $insEdge)) { return }
     if ($script:SeqRunning) { return }
 
@@ -1192,8 +1174,7 @@ $hotkeyTimer.Add_Tick({
         if ($script:State -eq 'hidden') { Open-Menu } else { Close-Menu }
     }
     if ($insEdge -and $script:State -eq 'done' -and $script:PendingHold) {
-        # Ya trajo el PRO/terminal desde el ERP: ahora si se pide la
-        # terminal para generar y copiar la nota de intra/hold.
+
         Enter-Terminal
     } elseif ($insEdge -and ($script:State -eq 'hidden' -or $script:State -eq 'done')) {
         if ($script:NotePair.Count -eq 2) {
