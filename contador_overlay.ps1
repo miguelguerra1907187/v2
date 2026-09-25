@@ -1,16 +1,3 @@
-# ============================================================
-#  contador_overlay.ps1  -  Contador BPH + PO/BOL ClipQueue
-#
-#  CONTADOR:  Alt+S = +1   |   F12 = -1   |   F11 = reporte
-#  COLA PO/BOL:
-#    Ctrl + Shift derecho  -> ventana de input (nuevo lote)
-#    Ctrl+V                -> pega actual, carga el siguiente
-#    Ctrl izq + Espacio    -> vaciar cola y borrar portapapeles
-#    `  (arriba del Tab)   -> 7 tabuladores
-#    Widget KG -> LBS      -> clic en la cajita "KG"
-# ============================================================
-
-# ── Single instance: solo una copia a la vez ──
 $lockFile = "$env:TEMP\ContadorOverlay.lock"
 if (Test-Path $lockFile) {
     $pid_guardado = Get-Content $lockFile -ErrorAction SilentlyContinue
@@ -67,12 +54,14 @@ $SHIFT_END     = 23   # 11pm
 # Sube este valor si tu flujo de reintento tarda mas de 10 seg
 $DEBOUNCE_SECS = 10
 
+# Bills en la hora (o buffer) para activar el arcoiris RGB (easter egg)
+$RGB_UMBRAL    = 50
+
 # ════════════════════════════════════════
 #         (no editar de aqui para abajo)
 # ════════════════════════════════════════
 $REG_PATH = "HKCU:\Software\ContadorOverlay"
 
-# ── Form overlay ──
 $form                 = New-Object System.Windows.Forms.Form
 $form.TopMost         = $true
 $form.FormBorderStyle = 'None'
@@ -99,7 +88,6 @@ $rtb.TabStop          = $false
 $rtb.ShortcutsEnabled = $false
 $form.Controls.Add($rtb)
 
-# ── Persistencia ──
 function Load-State {
     $now   = Get-Date
     $state = @{ Buffer = 0; Count = 0; Day = $now.Day; Hour = $now.Hour }
@@ -136,7 +124,6 @@ function Save-HourLog($hour, $count, $mins, $isOT = $false) {
     } catch {}
 }
 
-# ── FIX PUNTO 5: marca una hora como "cerrada" para que F11 no la pise ──
 function Mark-HourClosed($hour) {
     try {
         if (-not (Test-Path $REG_PATH)) { New-Item -Path $REG_PATH -Force | Out-Null }
@@ -170,7 +157,7 @@ function Load-HourLog {
     try {
         if (Test-Path $REG_PATH) {
             $reg = Get-ItemProperty -Path $REG_PATH -ErrorAction Stop
-            # Leer horas numericas
+
             $reg.PSObject.Properties |
                 Where-Object { $_.Name -match '^Hora\d+$' } |
                 ForEach-Object {
@@ -181,7 +168,7 @@ function Load-HourLog {
                         IsOT  = $reg.PSObject.Properties["OT$h"] -ne $null
                     }
                 }
-            # Leer hora MEDIA si existe
+
             if ($reg.PSObject.Properties["HoraMEDIA"]) {
                 $log["MEDIA"] = @{
                     Bills = [int]$reg.HoraMEDIA
@@ -194,14 +181,11 @@ function Load-HourLog {
     return $log
 }
 
-# ── Estado ──
 $saved           = Load-State
 $now             = Get-Date
 $global:lastDay  = $now.Day
 $global:lastHour = $now.Hour
 
-# ── Reset a las 4am del dia siguiente ──
-# Reset si ya paso las 4am del dia siguiente (cubre suspension y reinicios tardios)
 $resetPorCuatroAm = ($global:lastHour -ge 4) -and ($saved.Day -ne $global:lastDay)
 if ($resetPorCuatroAm) {
     $global:buffer = 0
@@ -212,21 +196,21 @@ if ($resetPorCuatroAm) {
     $global:buffer = $saved.Buffer
     $global:count  = $saved.Count
 } else {
-    # Hora guardada != hora actual: el programa estuvo cerrado y cambio de hora
+
     $savedEsOT = ($saved.Hour -lt $SHIFT_START) -or ($saved.Hour -ge $SHIFT_END)
     if ($saved.Hour -in $LUNCH_HOURS) {
-        # Lunch: no toca buffer, no guarda
+
         $global:buffer = $saved.Buffer
     } elseif ($savedEsOT -and $saved.Count -eq 0) {
-        # OT sin trabajo: descartar silenciosamente
+
         $global:buffer = $saved.Buffer
     } elseif ($savedEsOT) {
-        # OT con trabajo: guardar como OT, afecta buffer igual que hora normal
+
         $global:buffer = $saved.Buffer + ($saved.Count - $GOAL)
         Save-HourLog $saved.Hour $saved.Count 60 $true
         Mark-HourClosed $saved.Hour
     } else {
-        # Hora dentro del turno
+
         $meta          = if ($saved.Hour -in $BREAK_HOURS) { $GOAL_BREAK } else { $GOAL }
         $global:buffer = $saved.Buffer + ($saved.Count - $meta)
         $missedMins    = if ($saved.Hour -in $BREAK_HOURS) { 45 } else { 60 }
@@ -240,10 +224,9 @@ if ($resetPorCuatroAm) {
 $global:pressedAltS  = $false
 $global:pressedF11   = $false
 $global:pressedF12   = $false
-# ── DEBOUNCE: timestamp del ultimo Alt+S aceptado ──
+
 $global:lastAltSTime = [DateTime]::MinValue
 
-# ── Helpers overlay ──
 function Get-Meta {
     $h = (Get-Date).Hour
     if ($h -in $LUNCH_HOURS) { return $GOAL }
@@ -266,6 +249,55 @@ function Get-BufferColor($b) {
     return [System.Drawing.Color]::Red
 }
 
+$global:rgbHue    = 0
+$global:rptHue    = 0
+$global:rngBufIni = 0
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class RgbWin32 {
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+}
+"@ -ErrorAction SilentlyContinue
+
+function Hue-Color([double]$h) {
+    $h = (($h % 360) + 360) % 360
+    $x = 1 - [Math]::Abs((($h / 60) % 2) - 1)
+    switch ([int][Math]::Floor($h / 60)) {
+        0       { $r = 1;  $g = $x; $b = 0  }
+        1       { $r = $x; $g = 1;  $b = 0  }
+        2       { $r = 0;  $g = 1;  $b = $x }
+        3       { $r = 0;  $g = $x; $b = 1  }
+        4       { $r = $x; $g = 0;  $b = 1  }
+        default { $r = 1;  $g = 0;  $b = $x }
+    }
+    return [System.Drawing.Color]::FromArgb(255, [int]($r * 255), [int]($g * 255), [int]($b * 255))
+}
+
+function Pintar-Arcoiris($box, $rangos, $hueBase) {
+    $selIni = $box.SelectionStart; $selLen = $box.SelectionLength
+    [void][RgbWin32]::SendMessage($box.Handle, 0x0B, [IntPtr]::Zero, [IntPtr]::Zero)
+    foreach ($rg in $rangos) {
+        for ($i = 0; $i -lt $rg[1]; $i++) {
+            $box.SelectionStart  = $rg[0] + $i
+            $box.SelectionLength = 1
+            $box.SelectionColor  = Hue-Color ($hueBase + $i * 40)
+        }
+    }
+    $box.SelectionStart = $selIni; $box.SelectionLength = $selLen
+    [void][RgbWin32]::SendMessage($box.Handle, 0x0B, [IntPtr]1, [IntPtr]::Zero)
+    $box.Invalidate()
+}
+
+function Aplicar-RGBOverlay {
+    $rangos = @()
+    if ($global:count  -ge $RGB_UMBRAL) { $rangos += ,@(0, "$($global:count)".Length) }
+    if ($global:buffer -ge $RGB_UMBRAL) { $rangos += ,@($global:rngBufIni, "+$($global:buffer)".Length) }
+    if ($rangos.Count -gt 0) { Pintar-Arcoiris $rtb $rangos $global:rgbHue }
+}
+
 function Update-Display {
     $meta       = Get-Meta
     $countTxt   = "$($global:count)"
@@ -280,25 +312,17 @@ function Update-Display {
     $rtb.SelectionStart = $rtb.TextLength; $rtb.SelectionLength = 0
     $rtb.SelectionColor = $sepColor;       $rtb.AppendText('|')
     $rtb.SelectionStart = $rtb.TextLength; $rtb.SelectionLength = 0
+    $global:rngBufIni   = $rtb.TextLength
     $rtb.SelectionColor = $bufColor;       $rtb.AppendText($bufTxt)
     $rtb.SelectAll()
     $rtb.SelectionAlignment = 'Center'
+    Aplicar-RGBOverlay
 }
 
 Update-Display
 
-# ════════════════════════════════════════
-#         LOGICA DE REPORTE (F11)
-# ════════════════════════════════════════
-
 function Redondear-AcuartO($minutos) {
-    # Devuelve [mins_activos, es_media]
-    # Redondeo simetrico al cuarto de hora mas cercano:
-    #   0-7   -> 0   (la hora apenas comenzo, redondea HACIA ABAJO)
-    #   8-22  -> 15
-    #   23-37 -> 30  (media hora exacta -> penalizacion)
-    #   38-52 -> 45
-    #   53-59 -> 60  (la hora ya casi termino, redondea HACIA ARRIBA)
+
     if ($minutos -le 7)      { return 0,  $false }
     elseif ($minutos -le 22) { return 15, $false }
     elseif ($minutos -le 37) { return 30, $true  }
@@ -330,13 +354,10 @@ function Generar-Reporte($log) {
     $breakStrs = $BREAK_HOURS | ForEach-Object { "$_" }
     $lunchStrs = $LUNCH_HOURS | ForEach-Object { "$_" }
 
-    # Penalizacion MEDIA: sus bills se zerean, su tiempo (0.5hr) si cuenta
     $bills    = @{}
     $msjPenal = ""
     foreach ($k in $log.Keys) {
-        # Excluir entradas sin minutos activos reales (lunch, o una hora que
-        # apenas comenzo cuando se genero el reporte) — no deben afectar
-        # AVG, TOTAL, TIME ni BUFFER. (MEDIA siempre tiene 30 min, no se filtra)
+
         if ((Mins-DeClave $k $log) -eq 0) { continue }
         $bills[$k] = $log[$k].Bills
     }
@@ -345,7 +366,6 @@ function Generar-Reporte($log) {
         $bills["MEDIA"] = 0
     }
 
-    # TIME: minutos reales por tipo (igual que Python)
     $totalMins  = 0
     $totalBills = 0
     foreach ($k in $bills.Keys) {
@@ -355,13 +375,9 @@ function Generar-Reporte($log) {
 
     if ($totalMins -eq 0) { return @(@{ text = "No active time."; color = "DimGray" }) }
 
-    # AVG y BUFFER — exactamente igual que Python:
-    # promedio = total_bills / minutos_totales * 60
-    # diferencia = total_bills - (minutos_totales / 60 * GOAL)
     $promedio   = ($totalBills / $totalMins) * 60
     $diferencia = $totalBills - (($totalMins / 60) * $GOAL)
 
-    # Mejor hora (excluye breaks, comida y MEDIA)
     $bphPorHora = @{}
     foreach ($k in $bills.Keys) {
         $mBph = Mins-DeClave $k $log
@@ -372,13 +388,11 @@ function Generar-Reporte($log) {
     $mejorClave = if ($bphPorHora.Count -gt 0) { ($bphPorHora.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key } else { $null }
     $efficiency = if ($mejorClave -and $promedio -gt 0) { ($promedio / $bills[$mejorClave] * 100) } else { 0 }
 
-    # Formato TIME (igual que Python)
     $hEnt    = [Math]::Floor($totalMins / 60)
     $hFrac   = @(0, 0.25, 0.5, 0.75, 1)[[Math]::Round(($totalMins % 60) / 15)]
     $tTotal  = $hEnt + $hFrac
     $tDisplay = "${tTotal}hr"
 
-    # ── Construir lineas ──
     $lines   = [System.Collections.Generic.List[object]]::new()
     $onTrack = $promedio -ge $GOAL
 
@@ -391,7 +405,7 @@ function Generar-Reporte($log) {
     $lines.Add(@{ text = "--------------------"; color = "DimGray" })
 
     if ($diferencia -ge 0) {
-        $lines.Add(@{ text = "[+] BUFFER: +$([int]$diferencia)"; color = "Lime" })
+        $lines.Add(@{ text = "[+] BUFFER: +$([int]$diferencia)"; color = "Lime"; rgb = ([int]$diferencia -ge $RGB_UMBRAL) })
     } else {
         $lines.Add(@{ text = "[-] MISSING: $([int][Math]::Abs($diferencia))"; color = "OrangeRed" })
     }
@@ -403,7 +417,6 @@ function Generar-Reporte($log) {
         $lines.Add(@{ text = "CONSISTENCY: $([int]$efficiency)%"; color = "Yellow" })
     }
 
-    # ── BREAKDOWN por hora con color individual ──
     $entradas = $bills.GetEnumerator() |
         Sort-Object { if ($_.Key -eq "MEDIA") { 9999 } else { [int]$_.Key } } |
         Where-Object { -not ($_.Key -eq "MEDIA" -and $_.Value -eq 0) } |
@@ -420,9 +433,8 @@ function Generar-Reporte($log) {
         $meta_k  = if ($isBreak) { $GOAL_BREAK } else { $GOAL }
         $purp_k  = if ($isBreak) { $PURPLE_BREAK } else { $PURPLE_NORMAL }
 
-        # Color segun rendimiento
         $clr = if ($isMEDIA) {
-            "OrangeRed"   # MEDIA siempre penalizado
+            "OrangeRed"
         } elseif ($v -ge $purp_k) {
             "MediumOrchid"
         } elseif ($v -ge $meta_k) {
@@ -433,13 +445,12 @@ function Generar-Reporte($log) {
             "OrangeRed"
         }
 
-        # Etiqueta
         $label  = Formato-12h $k
         $isOT   = if ($log[$k].IsOT) { $log[$k].IsOT } else { $false }
         $sufijo = if ($isBreak) { " BREAK" } elseif ($isMEDIA) { " [!]" } elseif ($isOT) { " OT" } else { "" }
 
         $pad  = "{0,-7}" -f $label
-        $lines.Add(@{ text = "  $pad $v$sufijo"; color = $clr })
+        $lines.Add(@{ text = "  $pad $v$sufijo"; color = $clr; rgb = ($v -ge $RGB_UMBRAL) })
     }
 
     return $lines
@@ -450,7 +461,6 @@ function Show-Report {
     $minutos = $now.Minute
     $hora    = $now.Hour
 
-    # Redondear la hora actual
     $minsActivos, $esMedia = Redondear-AcuartO $minutos
     $breakStrsR = $BREAK_HOURS | ForEach-Object { "$_" }
     $lunchStrsR = $LUNCH_HOURS | ForEach-Object { "$_" }
@@ -459,7 +469,7 @@ function Show-Report {
     $horaEsOT    = (-not $horaEnTurno) -and ($hora -notin $LUNCH_HOURS)
 
     if ($horaEnTurno) {
-        # ── Hora dentro del turno oficial ──
+
         if ($esMedia) {
             $clave = "MEDIA"
         } elseif ("$hora" -in $breakStrsR) {
@@ -476,13 +486,12 @@ function Show-Report {
             Save-HourLog $clave $global:count $minsActivos
         }
     } elseif ($horaEsOT -and $global:count -gt 0) {
-        # ── Hora OT con trabajo: guardar si no esta cerrada ──
-        # Aplica logica de cuartos igual que horas normales
+
         if ($esMedia) {
             $clave = "MEDIA"
         } else {
             $clave       = "$hora"
-            $minsActivos = $minsActivos   # ya calculado por Redondear-AcuartO
+            $minsActivos = $minsActivos
         }
         $claveParaCheck = if ($esMedia) { "MEDIA" } else { "$hora" }
         if (-not (Is-HourClosed $claveParaCheck)) {
@@ -491,18 +500,17 @@ function Show-Report {
     }
 
     $log = Load-HourLog
-    # Si es MEDIA fuera de turno con trabajo, agregar en memoria
+
     if ($horaEsOT -and $esMedia -and $global:count -gt 0 -and -not $log.ContainsKey("MEDIA")) {
         $log["MEDIA"] = @{ Bills = $global:count; Mins = 30; IsOT = $true }
     }
-    # Si es MEDIA dentro del turno, agregar en memoria
+
     if ($horaEnTurno -and $esMedia -and -not $log.ContainsKey("MEDIA")) {
         $log["MEDIA"] = @{ Bills = $global:count; Mins = 30; IsOT = $false }
     }
 
     $lines = Generar-Reporte $log
 
-    # ── Ventana de reporte ──
     $rForm                 = New-Object System.Windows.Forms.Form
     $rForm.TopMost         = $true
     $rForm.FormBorderStyle = 'None'
@@ -530,6 +538,7 @@ function Show-Report {
     $rRtb.ShortcutsEnabled = $false
     $rForm.Controls.Add($rRtb)
 
+    $rgbRangos = @()
     foreach ($line in $lines) {
         $colorName = if ($line -is [hashtable]) { $line.color } else { "White" }
         $txt       = if ($line -is [hashtable]) { $line.text  } else { $line   }
@@ -537,10 +546,24 @@ function Show-Report {
         $rRtb.SelectionStart  = $rRtb.TextLength
         $rRtb.SelectionLength = 0
         $rRtb.SelectionColor  = $color
+        $ini = $rRtb.TextLength
         $rRtb.AppendText("$txt`n")
+        if ($line -is [hashtable] -and $line.rgb) { $rgbRangos += ,@($ini, "$txt".Length) }
     }
 
-    # ── Accion de cierre: resetea todo y overlay sigue corriendo ──
+    if ($rgbRangos.Count -gt 0) {
+        $rRtb.SelectionStart = 0; $rRtb.SelectionLength = 0
+        Pintar-Arcoiris $rRtb $rgbRangos $global:rptHue
+        $rTimer          = New-Object System.Windows.Forms.Timer
+        $rTimer.Interval = 70
+        $rTimer.Add_Tick({
+            $global:rptHue = ($global:rptHue + 15) % 360
+            Pintar-Arcoiris $rRtb $rgbRangos $global:rptHue
+        })
+        $rTimer.Start()
+        $rForm.Add_FormClosed({ $rTimer.Stop(); $rTimer.Dispose() })
+    }
+
     $closeAction = {
         $rForm.Close()
         $global:count    = 0
@@ -552,11 +575,9 @@ function Show-Report {
         Update-Display
     }
 
-    # Click en cualquier parte del reporte → cierra y resetea
     $rForm.Add_Click($closeAction)
     $rRtb.Add_Click($closeAction)
 
-    # F11 estando el reporte visible → cierra y resetea
     $rForm.Add_KeyDown({
         param($s, $e)
         if ($e.KeyCode -eq [System.Windows.Forms.Keys]::F11) {
@@ -574,7 +595,6 @@ function Show-Report {
     [void]$rForm.ShowDialog()
 }
 
-# ── Timer ──
 $timer          = New-Object System.Windows.Forms.Timer
 $timer.Interval = 50
 
@@ -583,7 +603,6 @@ $timer.Add_Tick({
     $nowHour = $now.Hour
     $nowDay  = $now.Day
 
-    # ── Reset al despertar de suspension si ya paso las 4am del dia siguiente ──
     if ($nowHour -ge 4 -and $nowDay -ne $global:lastDay) {
         $global:count    = 0
         $global:buffer   = 0
@@ -595,24 +614,23 @@ $timer.Add_Tick({
         return
     }
 
-    # ── Cambio de hora ──
     if ($nowHour -ne $global:lastHour) {
         $esOT    = ($global:lastHour -lt $SHIFT_START) -or ($global:lastHour -ge $SHIFT_END)
         $esLunch = $global:lastHour -in $LUNCH_HOURS
         $esBreak = $global:lastHour -in $BREAK_HOURS
 
         if ($esLunch) {
-            # Lunch: no guarda, no toca buffer
+
         } elseif ($esOT) {
-            # OT: solo guardar si hubo trabajo real
+
             if ($global:count -gt 0) {
                 Save-HourLog $global:lastHour $global:count 60 $true
                 Mark-HourClosed $global:lastHour
                 $global:buffer += ($global:count - $GOAL)
             }
-            # Si count=0: descarte silencioso, sin penalizacion
+
         } else {
-            # Hora normal dentro del turno
+
             $mins = if ($esBreak) { 45 } else { 60 }
             Save-HourLog $global:lastHour $global:count $mins
             Mark-HourClosed $global:lastHour
@@ -626,7 +644,6 @@ $timer.Add_Tick({
         Update-Display
     }
 
-    # ── Alt + S  →  +1 con debounce ──
     $alt = [Win32]::GetAsyncKeyState(0x12)
     $s   = [Win32]::GetAsyncKeyState(0x53)
     if (($alt -ne 0) -and ($s -ne 0)) {
@@ -643,7 +660,6 @@ $timer.Add_Tick({
         }
     } else { $global:pressedAltS = $false }
 
-    # ── F12  →  -1 (min 0) ──
     $f12 = [Win32]::GetAsyncKeyState(0x7B)
     if ($f12 -ne 0) {
         if (-not $global:pressedF12) {
@@ -654,7 +670,6 @@ $timer.Add_Tick({
         }
     } else { $global:pressedF12 = $false }
 
-    # ── F11  →  confirmacion + corte + reporte + cerrar ──
     $f11 = [Win32]::GetAsyncKeyState(0x7A)
     if ($f11 -ne 0) {
         if (-not $global:pressedF11) {
@@ -668,8 +683,7 @@ $timer.Add_Tick({
             )
             if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
                 Show-Report
-                # El reset lo hace el closeAction dentro de Show-Report
-                # El overlay sigue corriendo — solo reiniciamos el timer
+
                 $timer.Start()
             } else {
                 $timer.Start()
@@ -680,8 +694,16 @@ $timer.Add_Tick({
 
 $timer.Start()
 
-# ── Opcion C: excluir overlay del Alt+Tab y taskbar con WS_EX_TOOLWINDOW ──
-# Se aplica ANTES de mostrar la ventana forzando la creacion del handle
+$rgbTimer          = New-Object System.Windows.Forms.Timer
+$rgbTimer.Interval = 70
+$rgbTimer.Add_Tick({
+    if ($global:count -ge $RGB_UMBRAL -or $global:buffer -ge $RGB_UMBRAL) {
+        $global:rgbHue = ($global:rgbHue + 15) % 360
+        Aplicar-RGBOverlay
+    }
+})
+$rgbTimer.Start()
+
 $form.Handle | Out-Null
 $GWL_EXSTYLE      = -20
 $WS_EX_TOOLWINDOW = 0x00000080
@@ -689,10 +711,6 @@ $WS_EX_APPWINDOW  = 0x00040000
 $cur = [Win32]::GetWindowLong($form.Handle, $GWL_EXSTYLE)
 [void][Win32]::SetWindowLong($form.Handle, $GWL_EXSTYLE, ($cur -bor $WS_EX_TOOLWINDOW) -band -bnot $WS_EX_APPWINDOW)
 
-# ════════════════════════════════════════════════════════════
-#   PO / BOL CLIPQUEUE  (integrado: mismo proceso, mismo archivo)
-# ════════════════════════════════════════════════════════════
-# -- Win32: minimizar consola + GetAsyncKeyState + estilo ventana --
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -710,27 +728,19 @@ public class PoBolWin32 {
 }
 "@ -ErrorAction SilentlyContinue
 
-# Modo debug: si se define la variable de entorno PO_BOL_DEBUG=1
-# (la pone DEBUG_PO_BOL_ClipQueue.bat), la consola se queda visible
-# siempre. En uso normal la consola se oculta por completo (SW_HIDE):
-# no aparece en la barra de tareas ni en Alt+Tab, igual que el overlay
-# del contador. Toda la retroalimentacion normal va por Show-Toast.
 $global:DEBUG_MODE = ($env:PO_BOL_DEBUG -eq '1')
 
 function Minimize-Console {
     if ($global:DEBUG_MODE) { return }
     $hwnd = [PoBolWin32]::GetConsoleWindow()
-    [PoBolWin32]::ShowWindow($hwnd, 0) | Out-Null   # SW_HIDE
+    [PoBolWin32]::ShowWindow($hwnd, 0) | Out-Null
 }
 
 function Restore-Console {
     if ($global:DEBUG_MODE) { return }
-    # En uso normal nunca se vuelve a mostrar la consola; el estado se
-    # comunica con Show-Toast. Esto evita la pantalla grande de PowerShell
-    # que aparecia al abrir la ventana de input o al pegar.
+
 }
 
-# -- Toast -----------------------------------------------------
 function Show-Toast($title, $msg) {
     $n = New-Object System.Windows.Forms.NotifyIcon
     $n.Icon            = [System.Drawing.SystemIcons]::Application
@@ -743,20 +753,12 @@ function Show-Toast($title, $msg) {
     $n.Dispose()
 }
 
-# -- Sin procesamiento -------------------------------------------
-# El texto se usa tal cual lo entrega el OCR/portapapeles. Lo unico
-# que se hace es separar los elementos (por coma, diagonal o salto de
-# linea) para armar la cola; no se toca mayusculas/minusculas, no se
-# quitan simbolos ni se unen lineas.
 function Get-Lista($rawText) {
     $t = $rawText -replace '[,/\r\n]', ' '
     $t = $t -replace '\s+', ' '
     $t = $t.Trim()
     $items = @($t -split ' ' | Where-Object { $_.Trim() -ne '' })
 
-    # Quitar repetidas: se queda solo la PRIMERA vez que aparece cada una,
-    # respetando el orden original. No distingue mayusculas/minusculas
-    # (po123 y PO123 cuentan como la misma).
     $vistas = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $unicas = [System.Collections.Generic.List[string]]::new()
     foreach ($it in $items) {
@@ -766,7 +768,6 @@ function Get-Lista($rawText) {
     return $unicas.ToArray()
 }
 
-# -- Ventana de input --------------------------------------------
 function Show-InputWindow {
     $inForm = New-Object System.Windows.Forms.Form
     $inForm.Text            = "PO / BOL Filler"
@@ -794,7 +795,6 @@ function Show-InputWindow {
     $inTxt.ForeColor  = [System.Drawing.Color]::White
     $inTxt.Font       = New-Object System.Drawing.Font("Consolas", 11)
 
-    # Al pegar -> cerrar ventana automaticamente
     $inTxt.Add_KeyDown({
         param($s, $e)
         if ($e.Control -and $e.KeyCode -eq [System.Windows.Forms.Keys]::V) {
@@ -808,7 +808,6 @@ function Show-InputWindow {
 
     $inForm.Controls.AddRange(@($inLbl, $inTxt))
 
-    # Enfocar el textbox al abrir
     $inForm.Add_Shown({ $inTxt.Focus() })
 
     $result = $inForm.ShowDialog()
@@ -818,11 +817,6 @@ function Show-InputWindow {
     return $null
 }
 
-# -- Widget flotante: conversor KG -> LBS ---------------------------
-# Caja chiquita siempre visible en la esquina sup. derecha. No usa
-# ShowDialog (eso bloquearia todo el script) -> se muestra con Show()
-# normal y corre dentro del mismo bucle de mensajes que el motor de
-# hotkeys (Application.Run mas abajo). Un solo proceso, un solo .ps1.
 $sizeCompactoKG  = New-Object System.Drawing.Size(26, 14)
 $sizeExpandidoKG = New-Object System.Drawing.Size(115, 48)
 
@@ -863,7 +857,7 @@ $lblResultKG.Dock       = 'Fill'
 $formKG.Controls.Add($lblResultKG)
 
 $script:timerEsperaKG = New-Object System.Windows.Forms.Timer
-$script:timerEsperaKG.Interval = 15000 # 15 segundos
+$script:timerEsperaKG.Interval = 15000
 $script:timerEsperaKG.Add_Tick({ Encoger-FormularioKG })
 
 $script:estaExpandidoKG = $false
@@ -932,7 +926,6 @@ $txtKG.Add_KeyDown({
 
             $formKG.Refresh()
 
-            # Inicia el contador de 15s, NO se cierra al perder el foco
             $script:timerEsperaKG.Start()
         } catch {
             $lblResultKG.Text      = "?"
@@ -966,11 +959,6 @@ $formKG.Add_Paint({
     }
 })
 
-# Modeless: se muestra y sigue corriendo en el mismo bucle de mensajes
-# que el motor de hotkeys (Application.Run $engine, mas abajo). No
-# bloquea nada porque NO se usa ShowDialog() aqui.
-# Sacar el widget del menu Alt+Tab y de la barra de tareas (igual que el
-# contador): WS_EX_TOOLWINDOW, aplicado ANTES de mostrar la ventana.
 function Ocultar-DeAltTab($f) {
     $f.Handle | Out-Null
     $estilo = [Win32]::GetWindowLong($f.Handle, $GWL_EXSTYLE)
@@ -979,15 +967,6 @@ function Ocultar-DeAltTab($f) {
 Ocultar-DeAltTab $formKG
 $formKG.Show()
 
-# -- Panel de confirmacion de la cola (verificacion visual) ----------
-# Ningun script de polling puede garantizar 100% que nunca se le escape
-# un toque de tecla — es una limitacion fisica del metodo, no de este
-# codigo en particular. Lo que SI se puede garantizar es que, si algo
-# llega a fallar, no sea un fallo SILENCIOSO: este panel muestra, despues
-# de cada Ctrl+V real, exactamente que se acaba de pegar y que quedo
-# armado para el siguiente. Si lo que ves aqui no coincide con lo que
-# acabas de pegar en el ERP, sabes de inmediato que hay que corregir esa
-# linea a mano antes de seguir, en vez de descubrirlo hasta el final.
 $formQueue                 = New-Object System.Windows.Forms.Form
 $formQueue.TopMost         = $true
 $formQueue.FormBorderStyle = 'None'
@@ -1031,7 +1010,6 @@ function Ocultar-PanelCola {
     $formQueue.Hide()
 }
 
-# -- Estado -------------------------------------------------------
 $global:lista = @()
 $global:index = 0
 
@@ -1040,9 +1018,8 @@ $global:pressedTab          = $false
 $global:pressedCtrlV        = $false
 $global:pressedLCtrlSpace   = $false
 $global:lastCtrlVTime       = [DateTime]::MinValue
-$global:CTRLV_DEBOUNCE_MS   = 200   # tiempo minimo entre pegados aceptados
+$global:CTRLV_DEBOUNCE_MS   = 200
 
-# -- Cargar lista y preparar primera PO -------------------------
 function Cargar-Lista($lista) {
     $global:lista = $lista
     $global:index = 0
@@ -1070,11 +1047,9 @@ function Cargar-Lista($lista) {
     $panelRep = if ($global:repetidasQuitadas -gt 0) { "  (-$($global:repetidasQuitadas) rep)" } else { "" }
     Mostrar-PanelCola "ARMADO 1/$($lista.Count)$panelRep`n$($lista[0])"
 
-    # Minimizar para que el ERP quede al frente
     Minimize-Console
 }
 
-# -- Accion Ctrl+V -----------------------------------------------
 function Procesar-CtrlV {
     if ($global:lista.Count -eq 0) { return }
 
@@ -1085,19 +1060,10 @@ function Procesar-CtrlV {
     $pegado       = $global:lista[$i]
     $global:index = $i + 1
 
-    # Esperar antes de cambiar el portapapeles: le da tiempo al ERP de
-    # terminar de leer/pegar el elemento ACTUAL antes de que lo cambiemos
-    # por el siguiente. Sin esto, en un ERP lento el portapapeles podia
-    # cambiar antes de que el ERP llegara a leerlo, y el campo terminaba
-    # mostrando el segundo elemento en vez del primero (parecia que se
-    # "saltaba" la primera linea, pero en realidad era una carrera contra
-    # el portapapeles). 300ms para dar margen de sobra: esto es trabajo
-    # de precision, importa mas que no se pierda ninguna linea que la
-    # velocidad.
     Start-Sleep -Milliseconds 300
 
     if ($global:index -lt $total) {
-        # Cargar siguiente
+
         [System.Windows.Forms.Clipboard]::SetText($global:lista[$global:index])
         $restantes = $total - $global:index
         Restore-Console
@@ -1105,14 +1071,13 @@ function Procesar-CtrlV {
         Mostrar-PanelCola "PEGASTE: $pegado`nARMADO $($global:index+1)/$total : $($global:lista[$global:index])"
         Minimize-Console
     } else {
-        # Era la ultima -> limpiar y minimizar
+
         [System.Windows.Forms.Clipboard]::Clear()
         $global:lista  = @()
         $global:index  = 0
         Show-Toast "OK Cola terminada" "Todos los $total elementos pegados. Ctrl+Shift derecho para nuevo lote."
         Mostrar-PanelCola "PEGASTE: $pegado`nCOLA TERMINADA ($total/$total)"
-        # Antes era Start-Sleep 2000; ahora es un timer para no congelar
-        # el contador (mismo proceso) durante esos 2 segundos.
+
         $qHideTimer.Stop(); $qHideTimer.Start()
         Restore-Console
         Write-Host "  OK $pegado  ->  ULTIMO" -ForegroundColor Green
@@ -1123,35 +1088,22 @@ function Procesar-CtrlV {
     }
 }
 
-# -- Accion tecla ` (arriba del Tab) -> 7 tabuladores ------------
-# SendWait ya espera a que el tab se procese antes de regresar, asi que
-# sin pausa extra se manda lo mas rapido posible. Si el ERP es lento para
-# cambiar el foco entre campos y empieza a perder tabs, subir esto a 5-10ms.
 function Procesar-TabExtra {
     for ($t = 0; $t -lt 7; $t++) {
         [System.Windows.Forms.SendKeys]::SendWait("{TAB}")
     }
 }
 
-# -- Accion Ctrl+Shift derecho -> abrir ventana ----------------------
 function Abrir-VentanaInput {
-    # Vaciar la cola anterior antes de abrir la ventana: si quedaba algo
-    # pendiente del lote anterior, se descarta para que el nuevo pegado
-    # empiece siempre desde cero. OJO: NO se limpia el portapapeles aqui
-    # porque el usuario acaba de copiar texto del OCR y lo necesita para
-    # pegar dentro de este mismo dialog.
+
     $global:lista  = @()
     $global:index  = 0
     Ocultar-PanelCola
 
-    # No restauramos la consola aqui: el cuadro de input es TopMost y
-    # se ve solo con eso. Restaurar la consola antes hacia que se viera
-    # una pantalla grande de PowerShell tapando todo hasta hacerle click.
     $raw = Show-InputWindow
 
     if (-not [string]::IsNullOrWhiteSpace($raw)) {
-        # @() garantiza arreglo aunque sea 1 sola PO (si no, $lista[0]
-        # devolvia solo la primera LETRA de esa PO)
+
         $nuevaLista = @(Get-Lista $raw)
         if ($nuevaLista.Count -gt 0) {
             Cargar-Lista $nuevaLista
@@ -1161,22 +1113,16 @@ function Abrir-VentanaInput {
             Minimize-Console
         }
     } else {
-        # Cancelo sin escribir nada
+
         Minimize-Console
     }
 }
 
-# -- Motor de la cola: timer propio + GetAsyncKeyState (sin hook global) --
 $qTimer          = New-Object System.Windows.Forms.Timer
 $qTimer.Interval = 40
 
 function Drenar-AcumuladorTeclas {
-    # GetAsyncKeyState acumula en su bit bajo "se presiono desde la ultima
-    # llamada" aunque ya se haya soltado. Si el timer estuvo detenido (p.ej.
-    # mientras la ventana de input estaba abierta) ese acumulador se queda
-    # con teclas viejas (el Ctrl+V que usaste para pegar el OCR adentro de
-    # la ventanita). Llamar la funcion una vez y tirar el resultado limpia
-    # ese acumulador antes de volver a confiar en el.
+
     [void][PoBolWin32]::GetAsyncKeyState(0x11)
     [void][PoBolWin32]::GetAsyncKeyState(0x56)
     [void][PoBolWin32]::GetAsyncKeyState(0xA1)
@@ -1185,7 +1131,6 @@ function Drenar-AcumuladorTeclas {
     [void][PoBolWin32]::GetAsyncKeyState(0x20)
 }
 
-# -- Vaciar cola manualmente (Ctrl izq + Espacio) --------------------
 function Vaciar-Cola {
     $global:lista  = @()
     $global:index  = 0
@@ -1196,29 +1141,7 @@ function Vaciar-Cola {
 
 $qTimer.Add_Tick({
     try {
-        # NOTA SOBRE GetAsyncKeyState:
-        #  - bit alto (0x8000) = la tecla esta presionada AHORA MISMO.
-        #  - bit bajo (0x0001) = la tecla se presiono en algun momento desde
-        #    la ultima llamada a esta funcion, aunque ya se haya soltado.
-        #    Se "limpia" cada vez que se llama la funcion.
-        #
-        #  Usar solo el bit alto (como se hizo antes) es seguro contra
-        #  acumuladores viejos, pero con polling cada 40ms puede PERDER un
-        #  toque rapido de tecla si el usuario la suelta antes del siguiente
-        #  poll (toques de teclado rapidos suelen durar menos de 40ms) ->
-        #  eso causaba que a veces no se detectara un Ctrl+V real y la cola
-        #  se quedara "atrasada" un elemento (se repite uno y al final falta
-        #  el ultimo).
-        #
-        #  Usar solo el bit bajo (como se hacia originalmente) detecta
-        #  toques rapidos sin perder ninguno, pero si el timer estuvo
-        #  detenido y se reanuda, puede traer pegado un toque viejo.
-        #
-        #  Solucion: bit bajo para detectar el toque (no se pierde ningun
-        #  toque rapido) + bit alto de Ctrl para saber cuando "se acabo" el
-        #  combo y resetear el candado + Drenar-AcumuladorTeclas justo
-        #  despues de reanudar el timer para tirar cualquier acumulador
-        #  viejo de cuando estuvo pausado.
+
         $ctrlRaw   = [PoBolWin32]::GetAsyncKeyState(0x11)
         $rshiftRaw = [PoBolWin32]::GetAsyncKeyState(0xA1)
         $vRaw      = [PoBolWin32]::GetAsyncKeyState(0x56)
@@ -1226,20 +1149,14 @@ $qTimer.Add_Tick({
 
         $ctrlDown     = ($ctrlRaw     -band 0x8000) -ne 0
         $ctrlTapped   = ($ctrlRaw     -band 0x0001) -ne 0
-        # ctrlActive: igual de valido si Ctrl sigue presionado AHORA, o si se
-        # presiono y solto por completo entre el sondeo anterior y este. Sin
-        # el "or" del bit bajo, un combo Ctrl+V completo (presionar y soltar
-        # las dos teclas) que termina justo antes del siguiente sondeo de
-        # 40ms se perdia por completo: Ctrl ya no estaba "presionado ahora"
-        # cuando por fin se pregunto.
+
         $ctrlActive   = $ctrlDown -or $ctrlTapped
         $rshiftTapped = ($rshiftRaw   -band 0x0001) -ne 0
-        $vDown        = ($vRaw        -band 0x8000) -ne 0   # V presionada AHORA MISMO
+        $vDown        = ($vRaw        -band 0x8000) -ne 0
         $vTapped      = ($vRaw        -band 0x0001) -ne 0
         $backtickDown   = ($backtickRaw -band 0x8000) -ne 0
         $backtickTapped = ($backtickRaw -band 0x0001) -ne 0
 
-        # -- Ctrl + Shift derecho -> abrir ventana de input --
         if ($ctrlActive -and $rshiftTapped -and -not $global:pressedCtrlEnter) {
             $global:pressedCtrlEnter = $true
             $qTimer.Stop()
@@ -1249,7 +1166,6 @@ $qTimer.Add_Tick({
         }
         if (-not $ctrlActive) { $global:pressedCtrlEnter = $false }
 
-        # -- Ctrl + V -> avanzar cola (con debounce de tiempo) --
         if ($ctrlActive -and $vTapped -and -not $global:pressedCtrlV) {
             $ahora  = Get-Date
             $transcurrido = ($ahora - $global:lastCtrlVTime).TotalMilliseconds
@@ -1259,17 +1175,9 @@ $qTimer.Add_Tick({
                 Procesar-CtrlV
             }
         }
-        # Resetear cuando V se suelta, NO cuando se suelta Ctrl.
-        # Patron real de uso: Ctrl sostenido + picar V varias veces.
-        # Si el reset dependia de Ctrl, el candado se quedaba cerrado
-        # todo el tiempo que Ctrl estuviera abajo y solo se pegaba el
-        # primer elemento aunque siguieras picando V.
+
         if (-not $vDown) { $global:pressedCtrlV = $false }
 
-        # -- Ctrl izquierdo + Espacio -> vaciar cola ---------------------
-        # Mismo combo que abre el OCR: al presionarlo el script limpia la
-        # cola en paralelo, para que el nuevo escaneo empiece con lista
-        # fresca sin tener que entrar a la ventana de input primero.
         $lctrlRaw   = [PoBolWin32]::GetAsyncKeyState(0xA2)
         $spaceRaw   = [PoBolWin32]::GetAsyncKeyState(0x20)
         $lctrlActive = (($lctrlRaw -band 0x8000) -ne 0) -or (($lctrlRaw -band 0x0001) -ne 0)
@@ -1281,40 +1189,30 @@ $qTimer.Add_Tick({
         }
         if (-not $spaceDown) { $global:pressedLCtrlSpace = $false }
 
-        # -- Tecla ` (VK_OEM_3, arriba del Tab en teclado EUA) -> 7 tabs extra --
         if ($backtickTapped -and -not $global:pressedTab) {
             $global:pressedTab = $true
             Procesar-TabExtra
         }
         if (-not $backtickDown) { $global:pressedTab = $false }
     } catch {
-        # Cualquier error inesperado -> avisar con notificacion y cerrar
-        # limpio en vez de quedar colgado en silencio (consola oculta).
-        # Error inesperado -> se detiene SOLO la cola; el contador sigue.
+
         $qTimer.Stop()
         Show-Toast "PO/BOL se detuvo por un error" "$($_.Exception.Message)"
     }
 })
 
-# ════════════════════════════════════════
-#         ARRANQUE (contador + cola)
-# ════════════════════════════════════════
 Minimize-Console
 
-# Red de seguridad: un error fuera de los timers solo avisa, no cierra nada
 [System.Windows.Forms.Application]::add_ThreadException({
     param($s, $e)
     Show-Toast "Contador / PO-BOL: error" "$($e.Exception.Message)"
 })
 
 Drenar-AcumuladorTeclas
-# Limpiar tambien el "bit bajo" de las teclas del contador (Alt, S, F11,
-# F12) para que una pulsacion vieja de antes de arrancar no cuente.
+
 foreach ($vk in 0x12, 0x53, 0x7A, 0x7B) { [void][Win32]::GetAsyncKeyState($vk) }
 $qTimer.Start()
 
-# Application.Run (no ShowDialog) para que el widget KG y el panel de la
-# cola sigan siendo clickeables: ShowDialog deshabilita las demas ventanas.
 try {
     [System.Windows.Forms.Application]::Run($form)
 } finally {
